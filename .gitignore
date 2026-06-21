@@ -1,0 +1,32 @@
+# colcon / ROS2 build outputs
+build/
+install/
+log/
+
+# ROS bags
+*.bag
+*.db3
+*.mcap
+
+# large point cloud maps
+*.pcd
+*.ply
+*.las
+*.laz
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# temporary
+tmp/
+temp/
+*.log
