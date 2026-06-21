@@ -1,9 +1,9 @@
 [submodule "src/localization/FAST_LIO"]
 	path = src/localization/FAST_LIO
-	url = https://github.com/hku-mars/FAST_LIO.git
+	url = git@github.com:aaaPSH/FAST_LIO.git
 [submodule "src/localization/Point-LIO"]
 	path = src/localization/Point-LIO
-	url = https://github.com/hku-mars/Point-LIO.git
+	url = git@github.com:aaaPSH/Point-LIO.git
 [submodule "src/driver/livox_ros_driver2"]
 	path = src/driver/livox_ros_driver2
 	url = https://github.com/Livox-SDK/livox_ros_driver2.git
