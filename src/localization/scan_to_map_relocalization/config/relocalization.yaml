@@ -1,0 +1,45 @@
+scan_to_map_relocalization:
+  ros__parameters:
+    map_path: "maps/localization_map.pcd"
+    odom_topic: "/Odometry"
+    scan_topic: "/cloud_registered_body"
+    output_odom_topic: "/relocalization/odom"
+
+    map_frame: "map"
+    odom_frame: "camera_init"
+    base_frame: "body"
+    publish_tf: true
+    publish_aligned_scan: true
+    publish_local_map: true
+    require_initial_pose: true
+    use_odom_prediction: true
+
+    relocalize_every_n_scans: 1
+    min_scan_points: 80
+
+    # Coarse-to-fine local matching. Each level uses the current pose guess
+    # to crop a local submap, then runs GICP against that submap.
+    voxel_leaf_sizes: [0.5, 0.3, 0.08]
+    local_map_radius: 8.0
+    min_local_map_points: 100
+
+    max_correspondence_distance: 1.5
+    transformation_epsilon: 0.01
+    euclidean_fitness_epsilon: 0.01
+    fitness_score_threshold: 1.0
+    max_iterations: 30
+    gicp_correspondence_randomness: 20
+    gicp_max_optimizer_iterations: 20
+    ransac_iterations: 0
+    ransac_outlier_rejection_threshold: 0.05
+
+    enable_sor: true
+    sor_mean_k: 50
+    sor_stddev_mul_thresh: 1.0
+
+    initial_x: 0.0
+    initial_y: 0.0
+    initial_z: 0.0
+    initial_roll: 0.0
+    initial_pitch: 0.0
+    initial_yaw: 0.0

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -11,11 +12,13 @@
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
+#include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include <pcl/registration/icp.h>
+#include <pcl/registration/gicp.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -25,6 +28,7 @@ namespace
 {
 using PointT = pcl::PointXYZI;
 using CloudT = pcl::PointCloud<PointT>;
+using KdTreeT = pcl::KdTreeFLANN<PointT>;
 
 Eigen::Isometry3d poseMsgToIso(const geometry_msgs::msg::Pose & pose)
 {
@@ -89,6 +93,21 @@ Eigen::Isometry3d vectorToPose(const std::vector<double> & xyz_rpy)
   tf.translation() = Eigen::Vector3d(xyz_rpy[0], xyz_rpy[1], xyz_rpy[2]);
   return tf;
 }
+
+CloudT::Ptr voxelDownsample(const CloudT::ConstPtr & cloud, double leaf_size)
+{
+  CloudT::Ptr filtered(new CloudT);
+  if (leaf_size <= 0.0) {
+    *filtered = *cloud;
+    return filtered;
+  }
+
+  pcl::VoxelGrid<PointT> voxel;
+  voxel.setLeafSize(leaf_size, leaf_size, leaf_size);
+  voxel.setInputCloud(cloud);
+  voxel.filter(*filtered);
+  return filtered;
+}
 }  // namespace
 
 class ScanToMapRelocalizationNode : public rclcpp::Node
@@ -96,41 +115,8 @@ class ScanToMapRelocalizationNode : public rclcpp::Node
 public:
   ScanToMapRelocalizationNode() : Node("scan_to_map_relocalization")
   {
-    map_path_ = declare_parameter<std::string>("map_path", "maps/localization_map.pcd");
-    odom_topic_ = declare_parameter<std::string>("odom_topic", "/Odometry");
-    scan_topic_ = declare_parameter<std::string>("scan_topic", "/cloud_registered_body");
-    output_odom_topic_ = declare_parameter<std::string>("output_odom_topic", "/relocalization/odom");
-    map_frame_ = declare_parameter<std::string>("map_frame", "map");
-    odom_frame_ = declare_parameter<std::string>("odom_frame", "camera_init");
-    base_frame_ = declare_parameter<std::string>("base_frame", "body");
-    publish_tf_ = declare_parameter<bool>("publish_tf", true);
-    publish_aligned_scan_ = declare_parameter<bool>("publish_aligned_scan", true);
-    require_initial_pose_ = declare_parameter<bool>("require_initial_pose", true);
-    use_odom_prediction_ = declare_parameter<bool>("use_odom_prediction", true);
-    voxel_leaf_size_ = declare_parameter<double>("voxel_leaf_size", 0.25);
-    max_correspondence_distance_ = declare_parameter<double>("max_correspondence_distance", 1.5);
-    transformation_epsilon_ = declare_parameter<double>("transformation_epsilon", 0.01);
-    euclidean_fitness_epsilon_ = declare_parameter<double>("euclidean_fitness_epsilon", 0.01);
-    fitness_score_threshold_ = declare_parameter<double>("fitness_score_threshold", 1.0);
-    min_scan_points_ = static_cast<int>(declare_parameter<int>("min_scan_points", 80));
-    max_iterations_ = static_cast<int>(declare_parameter<int>("max_iterations", 30));
-    relocalize_every_n_scans_ =
-      std::max(1, static_cast<int>(declare_parameter<int>("relocalize_every_n_scans", 1)));
-
-    const std::vector<double> initial_pose_vec{
-      declare_parameter<double>("initial_x", 0.0), declare_parameter<double>("initial_y", 0.0),
-      declare_parameter<double>("initial_z", 0.0), declare_parameter<double>("initial_roll", 0.0),
-      declare_parameter<double>("initial_pitch", 0.0), declare_parameter<double>("initial_yaw", 0.0)};
-    initial_pose_ = vectorToPose(initial_pose_vec);
-    have_initial_pose_ = !require_initial_pose_;
-
-    loadMap();
-
-    icp_.setInputTarget(map_);
-    icp_.setMaximumIterations(max_iterations_);
-    icp_.setMaxCorrespondenceDistance(max_correspondence_distance_);
-    icp_.setTransformationEpsilon(transformation_epsilon_);
-    icp_.setEuclideanFitnessEpsilon(euclidean_fitness_epsilon_);
+    declareAndReadParameters();
+    loadMapPyramid();
 
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       odom_topic_, 50,
@@ -144,37 +130,112 @@ public:
 
     corrected_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(output_odom_topic_, 20);
     aligned_scan_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/relocalization/aligned_scan", 5);
+    local_map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/relocalization/local_map", 5);
     map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       "/relocalization/map", rclcpp::QoS(1).transient_local().reliable());
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
     publishMap();
 
+    map_timer_ = create_wall_timer(
+      std::chrono::seconds(2),
+      std::bind(&ScanToMapRelocalizationNode::publishMap, this));
+
+    RCLCPP_INFO(
+      get_logger(),
+      "local GICP relocalization ready: levels=%zu, local_radius=%.2f, map=%s",
+      voxel_leaf_sizes_.size(), local_map_radius_, map_path_.c_str());
     if (require_initial_pose_) {
       RCLCPP_INFO(
-        get_logger(), "loaded map and waiting for RViz /initialpose. Set RViz Fixed Frame to %s.",
+        get_logger(), "waiting for RViz /initialpose. Set RViz Fixed Frame to %s.",
         map_frame_.c_str());
-    } else {
-      RCLCPP_INFO(get_logger(), "loaded map and will initialize from initial_* parameters.");
     }
   }
 
 private:
-  void loadMap()
+  struct RegistrationResult
   {
-    CloudT raw_map;
-    if (pcl::io::loadPCDFile<PointT>(map_path_, raw_map) != 0 || raw_map.empty()) {
+    bool converged = false;
+    double score = std::numeric_limits<double>::infinity();
+    Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+    CloudT::Ptr aligned{new CloudT};
+    CloudT::Ptr local_map{new CloudT};
+  };
+
+  void declareAndReadParameters()
+  {
+    map_path_ = declare_parameter<std::string>("map_path", "maps/localization_map.pcd");
+    odom_topic_ = declare_parameter<std::string>("odom_topic", "/Odometry");
+    scan_topic_ = declare_parameter<std::string>("scan_topic", "/cloud_registered_body");
+    output_odom_topic_ = declare_parameter<std::string>("output_odom_topic", "/relocalization/odom");
+    map_frame_ = declare_parameter<std::string>("map_frame", "map");
+    odom_frame_ = declare_parameter<std::string>("odom_frame", "camera_init");
+    base_frame_ = declare_parameter<std::string>("base_frame", "body");
+
+    publish_tf_ = declare_parameter<bool>("publish_tf", true);
+    publish_aligned_scan_ = declare_parameter<bool>("publish_aligned_scan", true);
+    publish_local_map_ = declare_parameter<bool>("publish_local_map", true);
+    require_initial_pose_ = declare_parameter<bool>("require_initial_pose", true);
+    use_odom_prediction_ = declare_parameter<bool>("use_odom_prediction", true);
+    relocalize_every_n_scans_ =
+      std::max(1, static_cast<int>(declare_parameter<int>("relocalize_every_n_scans", 1)));
+    min_scan_points_ = static_cast<int>(declare_parameter<int>("min_scan_points", 80));
+
+    voxel_leaf_sizes_ =
+      declare_parameter<std::vector<double>>("voxel_leaf_sizes", std::vector<double>{1.0, 0.5, 0.25});
+    if (voxel_leaf_sizes_.empty()) {
+      voxel_leaf_sizes_.push_back(0.25);
+    }
+
+    local_map_radius_ = declare_parameter<double>("local_map_radius", 8.0);
+    min_local_map_points_ =
+      std::max(10, static_cast<int>(declare_parameter<int>("min_local_map_points", 300)));
+
+    max_correspondence_distance_ = declare_parameter<double>("max_correspondence_distance", 1.5);
+    transformation_epsilon_ = declare_parameter<double>("transformation_epsilon", 0.01);
+    euclidean_fitness_epsilon_ = declare_parameter<double>("euclidean_fitness_epsilon", 0.01);
+    fitness_score_threshold_ = declare_parameter<double>("fitness_score_threshold", 1.0);
+    max_iterations_ = std::max(1, static_cast<int>(declare_parameter<int>("max_iterations", 30)));
+    gicp_correspondence_randomness_ =
+      std::max(1, static_cast<int>(declare_parameter<int>("gicp_correspondence_randomness", 20)));
+    gicp_max_optimizer_iterations_ =
+      std::max(1, static_cast<int>(declare_parameter<int>("gicp_max_optimizer_iterations", 20)));
+    ransac_iterations_ = std::max(0, static_cast<int>(declare_parameter<int>("ransac_iterations", 0)));
+    ransac_outlier_rejection_threshold_ =
+      declare_parameter<double>("ransac_outlier_rejection_threshold", 0.05);
+
+    enable_sor_ = declare_parameter<bool>("enable_sor", true);
+    sor_mean_k_ = std::max(1, static_cast<int>(declare_parameter<int>("sor_mean_k", 50)));
+    sor_stddev_mul_thresh_ = declare_parameter<double>("sor_stddev_mul_thresh", 1.0);
+
+    const std::vector<double> initial_pose_vec{
+      declare_parameter<double>("initial_x", 0.0), declare_parameter<double>("initial_y", 0.0),
+      declare_parameter<double>("initial_z", 0.0), declare_parameter<double>("initial_roll", 0.0),
+      declare_parameter<double>("initial_pitch", 0.0), declare_parameter<double>("initial_yaw", 0.0)};
+    initial_pose_ = vectorToPose(initial_pose_vec);
+    have_initial_pose_ = !require_initial_pose_;
+  }
+
+  void loadMapPyramid()
+  {
+    CloudT::Ptr raw_map(new CloudT);
+    if (pcl::io::loadPCDFile<PointT>(map_path_, *raw_map) != 0 || raw_map->empty()) {
       throw std::runtime_error("failed to load non-empty PCD map: " + map_path_);
     }
 
-    map_.reset(new CloudT);
-    pcl::VoxelGrid<PointT> voxel;
-    voxel.setLeafSize(voxel_leaf_size_, voxel_leaf_size_, voxel_leaf_size_);
-    voxel.setInputCloud(raw_map.makeShared());
-    voxel.filter(*map_);
+    map_pyramid_.clear();
+    map_kdtrees_.clear();
+    for (const double leaf_size : voxel_leaf_sizes_) {
+      CloudT::Ptr level_map = voxelDownsample(raw_map, leaf_size);
+      KdTreeT::Ptr tree(new KdTreeT);
+      tree->setInputCloud(level_map);
+      map_pyramid_.push_back(level_map);
+      map_kdtrees_.push_back(tree);
+      RCLCPP_INFO(
+        get_logger(), "map level leaf=%.3f points=%zu", leaf_size, level_map->size());
+    }
 
-    RCLCPP_INFO(
-      get_logger(), "loaded localization map: raw=%zu filtered=%zu", raw_map.size(), map_->size());
+    map_for_publish_ = map_pyramid_.back();
   }
 
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
@@ -238,44 +299,145 @@ private:
 
     CloudT::Ptr scan(new CloudT);
     pcl::fromROSMsg(*msg, *scan);
-    if (static_cast<int>(scan->size()) < min_scan_points_) {
-      return;
-    }
-
-    CloudT::Ptr scan_filtered(new CloudT);
-    pcl::VoxelGrid<PointT> voxel;
-    voxel.setLeafSize(voxel_leaf_size_, voxel_leaf_size_, voxel_leaf_size_);
-    voxel.setInputCloud(scan);
-    voxel.filter(*scan_filtered);
+    CloudT::Ptr scan_filtered = preprocessScan(scan);
     if (static_cast<int>(scan_filtered->size()) < min_scan_points_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000, "scan rejected: only %zu points after filtering",
+        scan_filtered->size());
       return;
     }
 
-    const Eigen::Isometry3d predicted_map_base = use_odom_prediction_ ? map_to_odom * odom_tf : map_to_odom;
-    CloudT::Ptr aligned(new CloudT);
-    icp_.setInputSource(scan_filtered);
-    icp_.align(*aligned, predicted_map_base.matrix().cast<float>());
+    const Eigen::Isometry3d predicted_map_base =
+      use_odom_prediction_ ? map_to_odom * odom_tf : map_to_odom;
+    const RegistrationResult result = runLocalMapPyramidGicp(scan_filtered, predicted_map_base);
 
-    if (!icp_.hasConverged() || icp_.getFitnessScore() > fitness_score_threshold_) {
+    if (!result.converged || result.score > fitness_score_threshold_) {
       RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 1000, "ICP rejected: converged=%d score=%.3f",
-        icp_.hasConverged(), icp_.getFitnessScore());
+        get_logger(), *get_clock(), 1000, "GICP rejected: converged=%d score=%.3f",
+        result.converged, result.score);
       publishCorrectedOdom(odom, map_to_odom, predicted_map_base);
       return;
     }
 
-    const Eigen::Matrix4d corrected_mat = icp_.getFinalTransformation().cast<double>();
-    Eigen::Isometry3d corrected_map_base = Eigen::Isometry3d::Identity();
-    corrected_map_base.matrix() = corrected_mat;
-
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      map_to_odom_ = corrected_map_base * odom_tf.inverse();
+      map_to_odom_ = result.pose * odom_tf.inverse();
       map_to_odom = map_to_odom_;
     }
 
-    publishCorrectedOdom(odom, map_to_odom, corrected_map_base);
-    publishAlignedScan(*aligned, msg->header.stamp);
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 1000, "local GICP score=%.3f local_points=%zu",
+      result.score, result.local_map->size());
+
+    publishCorrectedOdom(odom, map_to_odom, result.pose);
+    publishAlignedScan(*result.aligned, msg->header.stamp);
+    publishLocalMap(*result.local_map, msg->header.stamp);
+  }
+
+  CloudT::Ptr preprocessScan(const CloudT::ConstPtr & scan)
+  {
+    CloudT::Ptr filtered(new CloudT);
+    *filtered = *scan;
+
+    if (enable_sor_ && static_cast<int>(filtered->size()) > sor_mean_k_) {
+      CloudT::Ptr sor_filtered(new CloudT);
+      pcl::StatisticalOutlierRemoval<PointT> sor;
+      sor.setInputCloud(filtered);
+      sor.setMeanK(sor_mean_k_);
+      sor.setStddevMulThresh(sor_stddev_mul_thresh_);
+      sor.filter(*sor_filtered);
+      filtered = sor_filtered;
+    }
+
+    return filtered;
+  }
+
+  RegistrationResult runLocalMapPyramidGicp(
+    const CloudT::ConstPtr & source, const Eigen::Isometry3d & initial_guess)
+  {
+    RegistrationResult result;
+    Eigen::Matrix4f current_guess = initial_guess.matrix().cast<float>();
+
+    for (std::size_t i = 0; i < voxel_leaf_sizes_.size(); ++i) {
+      CloudT::Ptr source_down = voxelDownsample(source, voxel_leaf_sizes_[i]);
+      if (static_cast<int>(source_down->size()) < min_scan_points_) {
+        return result;
+      }
+
+      const Eigen::Vector3d center(
+        current_guess(0, 3), current_guess(1, 3), current_guess(2, 3));
+      CloudT::Ptr local_map = extractLocalMap(i, center);
+      if (local_map->empty()) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "local map empty at level %zu", i);
+        return result;
+      }
+      // Only enforce min_local_map_points at the finest level (last iteration).
+      // Coarse levels may have fewer points due to heavy downsampling; they are
+      // only used to refine the initial guess for the next finer level.
+      if (i == voxel_leaf_sizes_.size() - 1 &&
+          static_cast<int>(local_map->size()) < min_local_map_points_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "local map too small at finest level %zu: %zu points (need %d)",
+          i, local_map->size(), min_local_map_points_);
+        return result;
+      }
+
+      pcl::GeneralizedIterativeClosestPoint<PointT, PointT> gicp;
+      gicp.setMaximumIterations(max_iterations_);
+      gicp.setMaxCorrespondenceDistance(max_correspondence_distance_);
+      gicp.setTransformationEpsilon(transformation_epsilon_);
+      gicp.setEuclideanFitnessEpsilon(euclidean_fitness_epsilon_);
+      gicp.setCorrespondenceRandomness(gicp_correspondence_randomness_);
+      gicp.setMaximumOptimizerIterations(gicp_max_optimizer_iterations_);
+      gicp.setRANSACIterations(ransac_iterations_);
+      gicp.setRANSACOutlierRejectionThreshold(ransac_outlier_rejection_threshold_);
+      gicp.setInputSource(source_down);
+      gicp.setInputTarget(local_map);
+
+      CloudT::Ptr aligned(new CloudT);
+      gicp.align(*aligned, current_guess);
+      if (!gicp.hasConverged()) {
+        return result;
+      }
+
+      current_guess = gicp.getFinalTransformation();
+      result.converged = true;
+      result.score = gicp.getFitnessScore();
+      result.aligned = aligned;
+      result.local_map = local_map;
+    }
+
+    result.pose = Eigen::Isometry3d::Identity();
+    result.pose.matrix() = current_guess.cast<double>();
+    return result;
+  }
+
+  CloudT::Ptr extractLocalMap(std::size_t level, const Eigen::Vector3d & center)
+  {
+    CloudT::Ptr local_map(new CloudT);
+    if (level >= map_pyramid_.size()) {
+      return local_map;
+    }
+
+    PointT search_point;
+    search_point.x = static_cast<float>(center.x());
+    search_point.y = static_cast<float>(center.y());
+    search_point.z = static_cast<float>(center.z());
+
+    std::vector<int> indices;
+    std::vector<float> sq_distances;
+    map_kdtrees_[level]->radiusSearch(search_point, local_map_radius_, indices, sq_distances);
+    local_map->reserve(indices.size());
+    for (const int index : indices) {
+      local_map->push_back((*map_pyramid_[level])[index]);
+    }
+    local_map->width = static_cast<uint32_t>(local_map->size());
+    local_map->height = 1;
+    local_map->is_dense = map_pyramid_[level]->is_dense;
+    return local_map;
   }
 
   void publishCorrectedOdom(
@@ -307,13 +469,33 @@ private:
     aligned_scan_pub_->publish(msg);
   }
 
+  void publishLocalMap(const CloudT & cloud, const builtin_interfaces::msg::Time & stamp)
+  {
+    if (!publish_local_map_) {
+      return;
+    }
+
+    sensor_msgs::msg::PointCloud2 msg;
+    pcl::toROSMsg(cloud, msg);
+    msg.header.stamp = stamp;
+    msg.header.frame_id = map_frame_;
+    local_map_pub_->publish(msg);
+  }
+
   void publishMap()
   {
+    if (map_for_publish_->empty()) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "map is empty, nothing to publish");
+      return;
+    }
     sensor_msgs::msg::PointCloud2 msg;
-    pcl::toROSMsg(*map_, msg);
+    pcl::toROSMsg(*map_for_publish_, msg);
     msg.header.stamp = now();
     msg.header.frame_id = map_frame_;
     map_pub_->publish(msg);
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 5000, "published map on %s: %zu points",
+      map_pub_->get_topic_name(), map_for_publish_->size());
   }
 
   std::string map_path_;
@@ -323,22 +505,36 @@ private:
   std::string map_frame_;
   std::string odom_frame_;
   std::string base_frame_;
+
   bool publish_tf_ = true;
   bool publish_aligned_scan_ = true;
+  bool publish_local_map_ = true;
   bool require_initial_pose_ = true;
   bool use_odom_prediction_ = true;
-  double voxel_leaf_size_ = 0.25;
+  bool enable_sor_ = true;
+
+  double local_map_radius_ = 8.0;
   double max_correspondence_distance_ = 1.5;
   double transformation_epsilon_ = 0.01;
   double euclidean_fitness_epsilon_ = 0.01;
   double fitness_score_threshold_ = 1.0;
+  double ransac_outlier_rejection_threshold_ = 0.05;
+  double sor_stddev_mul_thresh_ = 1.0;
+
   int min_scan_points_ = 80;
+  int min_local_map_points_ = 300;
   int max_iterations_ = 30;
+  int gicp_correspondence_randomness_ = 20;
+  int gicp_max_optimizer_iterations_ = 20;
+  int ransac_iterations_ = 0;
   int relocalize_every_n_scans_ = 1;
   int scan_count_ = 0;
+  int sor_mean_k_ = 50;
 
-  CloudT::Ptr map_{new CloudT};
-  pcl::IterativeClosestPoint<PointT, PointT> icp_;
+  std::vector<double> voxel_leaf_sizes_;
+  std::vector<CloudT::Ptr> map_pyramid_;
+  std::vector<KdTreeT::Ptr> map_kdtrees_;
+  CloudT::Ptr map_for_publish_{new CloudT};
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
   std::mutex mutex_;
@@ -355,7 +551,9 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr corrected_odom_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr aligned_scan_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr local_map_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
+  rclcpp::TimerBase::SharedPtr map_timer_;
 };
 
 int main(int argc, char ** argv)

@@ -13,6 +13,7 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time')
     map_path = LaunchConfiguration('map_path')
     fast_lio_config_file = LaunchConfiguration('fast_lio_config_file')
+    relocalization_config_file = LaunchConfiguration('relocalization_config_file')
     rviz_cfg = LaunchConfiguration('rviz_cfg')
     require_initial_pose = LaunchConfiguration('require_initial_pose')
 
@@ -23,6 +24,8 @@ def generate_launch_description():
     default_map_path = os.path.abspath(
         os.path.join(os.getcwd(), 'maps', 'localization_map.pcd'))
     default_rviz_cfg = os.path.join(fast_lio_share, 'rviz', 'fastlio.rviz')
+    default_relocalization_config_file = os.path.join(
+        relocalization_share, 'config', 'relocalization.yaml')
 
     simulation_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -48,6 +51,7 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(
             os.path.join(relocalization_share, 'launch', 'relocalization.launch.py')),
         launch_arguments={
+            'config_file': relocalization_config_file,
             'use_sim_time': use_sim_time,
             'map_path': map_path,
             'odom_topic': '/Odometry',
@@ -78,6 +82,10 @@ def generate_launch_description():
             'fast_lio_config_file',
             default_value='mid360.yaml',
             description='FAST_LIO config file in the fast_lio config directory'),
+        DeclareLaunchArgument(
+            'relocalization_config_file',
+            default_value=default_relocalization_config_file,
+            description='YAML parameter file for scan-to-map relocalization'),
         DeclareLaunchArgument(
             'require_initial_pose',
             default_value='true',

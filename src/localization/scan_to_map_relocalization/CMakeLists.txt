@@ -14,7 +14,7 @@ find_package(Eigen3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(Qhull CONFIG REQUIRED)
-find_package(PCL REQUIRED COMPONENTS common io filters registration)
+find_package(PCL REQUIRED COMPONENTS common io filters kdtree registration)
 find_package(pcl_conversions REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -47,7 +47,7 @@ install(TARGETS scan_to_map_relocalization
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(DIRECTORY launch
+install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME}
 )
 
