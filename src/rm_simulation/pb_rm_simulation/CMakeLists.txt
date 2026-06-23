@@ -51,6 +51,11 @@ endif()
 ## Install ##
 #############
 
+install(PROGRAMS
+  scripts/mecanum_keyboard.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_auto_package(
   INSTALL_TO_SHARE
   launch
