@@ -5,46 +5,46 @@
 ## 环境要求
 
 - Ubuntu 22.04 (WSL2 或原生)
-- Docker + Docker Compose
-- NVIDIA GPU + nvidia-container-toolkit（Gazebo GPU 加速）
-- X11 显示服务（rviz2 / Gazebo GUI）
+- ROS2 Humble
+- Livox SDK2（`livox_ros_driver2` 依赖，需安装到 `/usr/local`）
+- Gazebo / rviz2 图形环境（仿真和可视化时需要）
 
 ## 快速开始
 
-### 1. 构建 Docker 镜像
+### 1. 初始化子模块
 
 ```bash
-cd docker
-./build.sh
+git submodule update --init --recursive
 ```
 
-### 2. 启动开发容器
-
-```bash
-./run.sh
-```
-
-### 3. 克隆依赖（容器内）
-
-```bash
-cd /root/mosas_sentry
-
-# FAST_LIO2 核心
-git clone https://github.com/hku-mars/FAST_LIO.git src/FAST_LIO
-
-# Livox 驱动（FAST_LIO 依赖）
-git clone https://github.com/Livox-SDK/livox_ros_driver2.git src/livox_ros_driver2
-```
-
-### 4. 编译工作空间
+### 2. 安装依赖
 
 ```bash
 source /opt/ros/humble/setup.bash
-rosdep install --from-paths src --ignore-src -y
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+rosdep install --from-paths src --ignore-src -r -y
 ```
 
-### 5. 运行
+`livox_ros_driver2` 还需要先安装 Livox SDK2，并确保系统中存在：
+
+```bash
+/usr/local/lib/liblivox_lidar_sdk_shared.so
+```
+
+### 3. 编译工作空间
+
+```bash
+./scripts/build_humble.sh
+```
+
+或手动执行：
+
+```bash
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release -DROS_EDITION=ROS2 -DDISTRO_ROS=humble
+```
+
+### 4. 运行
 
 ```bash
 source install/setup.bash
@@ -55,51 +55,49 @@ ros2 launch fast_lio mapping.launch.py
 
 ```
 mosas_sentry/
-├── docker/
-│   ├── Dockerfile            # 开发镜像定义
-│   ├── docker-compose.yml    # 容器服务配置
-│   ├── build.sh              # 构建脚本
-│   └── run.sh                # 启动脚本
-├── .devcontainer/
-│   └── devcontainer.json     # VS Code Remote Container 配置
-├── src/                      # ROS2 包（自行克隆/创建）
-│   ├── FAST_LIO/             # FAST_LIO2 算法
-│   ├── livox_ros_driver2/    # Livox 雷达驱动
-│   ├── mosas_sentry_description/  # URDF 模型
-│   ├── mosas_sentry_bringup/      # Launch 文件
-│   ├── mosas_sentry_nav/          # Nav2 参数配置
-│   └── mosas_sentry_sim/          # Gazebo 仿真
+├── scripts/                  # 工作区脚本
+│   └── build_humble.sh       # ROS2 Humble 统一构建入口
+├── src/                      # ROS2 源码区，只放源码包和子模块
+│   ├── driver/
+│   │   └── livox_ros_driver2/ # Livox 雷达驱动
+│   ├── localization/
+│   │   ├── FAST_LIO/         # FAST_LIO2 定位/建图
+│   │   └── Point-LIO/        # Point-LIO，可按需启用
+│   └── rm_simulation/
+│       ├── pb_rm_simulation/ # RoboMaster 仿真场景
+│       └── livox_laser_simulation_RO2/
+│                             # Livox 雷达仿真插件
+├── build/                    # colcon 生成目录，不提交
+├── install/                  # colcon 安装目录，不提交
+├── log/                      # colcon 日志目录，不提交
 └── README.md
 ```
 
-## Docker 镜像包含
+## 架构约定
 
-| 组件 | 说明 |
-|------|------|
-| ROS2 Humble Desktop Full | 核心 + Gazebo Fortress + rviz2 |
-| Nav2 | 导航栈（规划器/控制器/行为树） |
-| SLAM Toolbox | 在线 SLAM 建图 |
-| robot_localization | EKF/UKF 传感器融合 |
-| ros2_control + controllers | 硬件抽象 + 差速驱动 |
-| Gazebo ROS2 Control | 仿真插件 |
-| PCL + Eigen3 | FAST_LIO2 依赖 |
-| Livox SDK2 | Livox 雷达 SDK |
-| colcon / rosdep / gdb | 开发调试工具 |
-
-## VS Code 开发
-
-在 VS Code 中安装 [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) 扩展，打开项目后选择 **"Reopen in Container"** 即可获得完整的 ROS2 开发环境（IntelliSense、调试、终端）。
+- 根目录是唯一 colcon 工作区入口，不要在 `src/` 内执行 `colcon build`。
+- `src/driver` 放硬件驱动，`src/localization` 放定位建图算法，`src/rm_simulation` 放仿真相关包。
+- 第三方包以 Git submodule 管理，更新依赖时优先更新子模块指针。
+- `Point-LIO` 当前带有 `COLCON_IGNORE`，需要参与编译时删除该文件。
 
 ## 常见问题
 
-**Gazebo/rviz2 无法打开显示**
-- 确保运行了 `xhost +local:docker`
-- 检查 `DISPLAY` 环境变量是否正确
+**Livox 驱动提示找不到 `package.xml`**
 
-**DDS 节点无法互相发现**
-- 确认使用 `network_mode: host`
-- 检查 `ROS_DOMAIN_ID` 是否一致
+`livox_ros_driver2` 上游同时支持 ROS1/ROS2，仓库中原始文件名是 `package_ROS2.xml`。根目录构建脚本会在编译前自动准备 ROS2 用的 `package.xml`。
 
-**GPU 未生效**
-- 确认安装了 `nvidia-container-toolkit`
-- 运行 `docker info | grep -i runtime` 检查 nvidia runtime
+**Livox 驱动提示找不到 `liblivox_lidar_sdk_shared.so`**
+
+请先安装 Livox SDK2，并确认 `/usr/local/lib` 在动态库路径中：
+
+```bash
+export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/usr/local/lib
+```
+
+**FAST_LIO 提示找不到 ikd-Tree**
+
+初始化嵌套子模块：
+
+```bash
+git submodule update --init --recursive
+```

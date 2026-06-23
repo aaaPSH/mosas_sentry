@@ -30,3 +30,7 @@ Thumbs.db
 tmp/
 temp/
 *.log
+
+#agent
+.codex
+.agents

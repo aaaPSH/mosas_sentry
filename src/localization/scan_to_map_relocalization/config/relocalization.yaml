@@ -14,8 +14,26 @@ scan_to_map_relocalization:
     require_initial_pose: true
     use_odom_prediction: true
 
-    relocalize_every_n_scans: 1
+    relocalize_every_n_scans: 5
     min_scan_points: 80
+
+    # --- Adaptive relocalization ---
+    # Normal mode: trust LIO, check every N scans (relocalize_every_n_scans)
+    #   - GICP just confirms LIO, no map→odom update needed
+    # Drift mode: delta moderate, collect GICP evidence, require consistency
+    # Lost mode: delta large, aggressive collection, require consistency
+    consistency_translation_thresh: 0.1  # below → NORMAL, above → DRIFT
+    consistency_yaw_thresh: 0.1         # below → NORMAL, above → DRIFT
+    max_correction_translation: 1.0     # above → LOST mode
+    max_correction_yaw: 0.5             # above → LOST mode
+    # GICP validation in DRIFT/LOST mode:
+    drift_score_threshold: 0.2          # stricter score threshold for recovery
+    drift_consistency_frames: 3         # require N consecutive consistent GICP results
+    drift_consistency_translation: 0.3  # max difference (m) between consecutive GICP results
+    drift_consistency_yaw: 0.1          # max difference (rad) between consecutive GICP results
+    min_recovery_map_points: 300        # minimum local map points for a valid recovery match
+    drift_relocalize_every_n: 3         # relocalization frequency in drift mode
+    lost_relocalize_every_n: 1          # relocalization frequency in lost mode
 
     # Coarse-to-fine local matching. Each level uses the current pose guess
     # to crop a local submap, then runs GICP against that submap.

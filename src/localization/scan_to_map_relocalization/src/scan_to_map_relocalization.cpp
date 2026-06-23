@@ -208,6 +208,28 @@ private:
     sor_mean_k_ = std::max(1, static_cast<int>(declare_parameter<int>("sor_mean_k", 50)));
     sor_stddev_mul_thresh_ = declare_parameter<double>("sor_stddev_mul_thresh", 1.0);
 
+    // --- Adaptive relocalization parameters ---
+    consistency_translation_thresh_ =
+      declare_parameter<double>("consistency_translation_thresh", 0.5);
+    consistency_yaw_thresh_ = declare_parameter<double>("consistency_yaw_thresh", 0.1);
+    max_correction_translation_ =
+      declare_parameter<double>("max_correction_translation", 2.0);
+    max_correction_yaw_ = declare_parameter<double>("max_correction_yaw", 0.5);
+    drift_score_threshold_ =
+      declare_parameter<double>("drift_score_threshold", 0.3);
+    drift_consistency_frames_ =
+      std::max(2, static_cast<int>(declare_parameter<int>("drift_consistency_frames", 3)));
+    drift_consistency_translation_ =
+      declare_parameter<double>("drift_consistency_translation", 0.3);
+    drift_consistency_yaw_ =
+      declare_parameter<double>("drift_consistency_yaw", 0.1);
+    min_recovery_map_points_ =
+      std::max(50, static_cast<int>(declare_parameter<int>("min_recovery_map_points", 200)));
+    lost_relocalize_every_n_ =
+      std::max(1, static_cast<int>(declare_parameter<int>("lost_relocalize_every_n", 1)));
+    drift_relocalize_every_n_ =
+      std::max(1, static_cast<int>(declare_parameter<int>("drift_relocalize_every_n", 3)));
+
     const std::vector<double> initial_pose_vec{
       declare_parameter<double>("initial_x", 0.0), declare_parameter<double>("initial_y", 0.0),
       declare_parameter<double>("initial_z", 0.0), declare_parameter<double>("initial_roll", 0.0),
@@ -292,7 +314,13 @@ private:
       map_to_odom = map_to_odom_;
     }
 
-    if (++scan_count_ % relocalize_every_n_scans_ != 0) {
+    // --- Adaptive frequency: choose skip interval based on current mode ---
+    const int effective_interval =
+      (relocalization_mode_ == MODE_LOST) ? lost_relocalize_every_n_ :
+      (relocalization_mode_ == MODE_DRIFT) ? drift_relocalize_every_n_ :
+      relocalize_every_n_scans_;
+
+    if (++scan_count_ % effective_interval != 0) {
       publishCorrectedOdom(odom, map_to_odom, map_to_odom * odom_tf);
       return;
     }
@@ -315,21 +343,169 @@ private:
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 1000, "GICP rejected: converged=%d score=%.3f",
         result.converged, result.score);
+      pending_corrections_.clear();
       publishCorrectedOdom(odom, map_to_odom, predicted_map_base);
       return;
     }
 
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      map_to_odom_ = result.pose * odom_tf.inverse();
-      map_to_odom = map_to_odom_;
+    // --- Evaluate relocalization result ---
+    const Eigen::Isometry3d relocalization_pose = result.pose;
+    const Eigen::Isometry3d lio_pose = map_to_odom * odom_tf;
+    const Eigen::Isometry3d delta = lio_pose.inverse() * relocalization_pose;
+
+    const double delta_translation = delta.translation().norm();
+    const Eigen::AngleAxisd delta_aa(delta.linear());
+    const double delta_yaw = std::abs(delta_aa.angle());
+
+    // --- Classify into three modes based on delta ---
+    if (delta_translation > max_correction_translation_ ||
+        delta_yaw > max_correction_yaw_) {
+      // Case 3: Lost localization — large discrepancy
+      if (relocalization_mode_ != MODE_LOST) {
+        RCLCPP_WARN(
+          get_logger(),
+          "LOST LOCALIZATION: delta=%.2fm/%.2frad, need %d consistent GICP frames to recover",
+          delta_translation, delta_yaw, drift_consistency_frames_);
+        pending_corrections_.clear();
+      }
+      relocalization_mode_ = MODE_LOST;
+    } else if (delta_translation > consistency_translation_thresh_ ||
+               delta_yaw > consistency_yaw_thresh_) {
+      // Case 2: LIO has drifted — moderate discrepancy
+      if (relocalization_mode_ != MODE_DRIFT) {
+        RCLCPP_WARN(
+          get_logger(),
+          "LIO DRIFT suspected: delta=%.2fm/%.2frad, collecting GICP evidence",
+          delta_translation, delta_yaw);
+        pending_corrections_.clear();
+      }
+      relocalization_mode_ = MODE_DRIFT;
+    } else {
+      // Case 1: Normal — small discrepancy, LIO is fine
+      if (relocalization_mode_ != MODE_NORMAL) {
+        RCLCPP_INFO(
+          get_logger(), "relocalization back to normal: delta=%.3fm/%.3frad",
+          delta_translation, delta_yaw);
+        pending_corrections_.clear();
+      }
+      relocalization_mode_ = MODE_NORMAL;
     }
 
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 1000, "local GICP score=%.3f local_points=%zu",
-      result.score, result.local_map->size());
+    // --- GICP validation: score check ---
+    const bool strict_score = (relocalization_mode_ != MODE_NORMAL);
+    const double score_limit = strict_score ? drift_score_threshold_ : fitness_score_threshold_;
+    if (result.score > score_limit) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "GICP score too high for mode %d: %.3f > %.3f",
+        static_cast<int>(relocalization_mode_), result.score, score_limit);
+      pending_corrections_.clear();
+      publishCorrectedOdom(odom, map_to_odom, predicted_map_base);
+      return;
+    }
 
-    publishCorrectedOdom(odom, map_to_odom, result.pose);
+    // --- GICP validation: local map quality ---
+    if (strict_score &&
+        static_cast<int>(result.local_map->size()) < min_recovery_map_points_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "local map too sparse for recovery: %zu points (need %d)",
+        result.local_map->size(), min_recovery_map_points_);
+      pending_corrections_.clear();
+      publishCorrectedOdom(odom, map_to_odom, predicted_map_base);
+      return;
+    }
+
+    // --- NORMAL mode: LIO is fine, just confirm, don't update ---
+    if (relocalization_mode_ == MODE_NORMAL) {
+      pending_corrections_.clear();
+      // No need to update map→odom — LIO hasn't drifted, delta is small
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "NORMAL: GICP confirms LIO (delta=%.3fm), no correction needed",
+        delta_translation);
+      publishCorrectedOdom(odom, map_to_odom, predicted_map_base);
+      publishAlignedScan(*result.aligned, msg->header.stamp);
+      publishLocalMap(*result.local_map, msg->header.stamp);
+      return;
+    }
+
+    // --- DRIFT / LOST mode: collect GICP candidates, require consistency ---
+    const Eigen::Isometry3d candidate_m2o = relocalization_pose * odom_tf.inverse();
+    pending_corrections_.push_back(candidate_m2o);
+
+    // Keep only the last N candidates
+    while (static_cast<int>(pending_corrections_.size()) > drift_consistency_frames_) {
+      pending_corrections_.erase(pending_corrections_.begin());
+    }
+
+    // Check if we have enough candidates
+    if (static_cast<int>(pending_corrections_.size()) < drift_consistency_frames_) {
+      RCLCPP_INFO(
+        get_logger(),
+        "collecting GICP evidence (%d/%d): score=%.3f delta=%.3fm",
+        static_cast<int>(pending_corrections_.size()), drift_consistency_frames_,
+        result.score, delta_translation);
+      publishCorrectedOdom(odom, map_to_odom, predicted_map_base);
+      publishAlignedScan(*result.aligned, msg->header.stamp);
+      publishLocalMap(*result.local_map, msg->header.stamp);
+      return;
+    }
+
+    // Check consistency: all recent candidates must agree with each other
+    bool consistent = true;
+    for (int i = 1; i < drift_consistency_frames_; ++i) {
+      const Eigen::Isometry3d diff =
+        pending_corrections_[i - 1].inverse() * pending_corrections_[i];
+      const double t_diff = diff.translation().norm();
+      const double y_diff = std::abs(Eigen::AngleAxisd(diff.linear()).angle());
+      if (t_diff > drift_consistency_translation_ || y_diff > drift_consistency_yaw_) {
+        consistent = false;
+        RCLCPP_INFO(
+          get_logger(),
+          "GICP candidates inconsistent: frame %d vs %d: t=%.3fm y=%.3frad",
+          i - 1, i, t_diff, y_diff);
+        break;
+      }
+    }
+
+    if (!consistent) {
+      // GICP results are jumping around — not trustworthy
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "GICP results inconsistent across %d frames, rejecting",
+        drift_consistency_frames_);
+      pending_corrections_.clear();
+      publishCorrectedOdom(odom, map_to_odom, predicted_map_base);
+      publishAlignedScan(*result.aligned, msg->header.stamp);
+      publishLocalMap(*result.local_map, msg->header.stamp);
+      return;
+    }
+
+    // All checks passed — accept the correction (use the latest candidate)
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      map_to_odom_ = candidate_m2o;
+      map_to_odom = map_to_odom_;
+    }
+    pending_corrections_.clear();
+
+    // After correction, re-evaluate: if delta is now small, return to normal
+    const Eigen::Isometry3d new_delta =
+      (map_to_odom * odom_tf).inverse() * relocalization_pose;
+    if (new_delta.translation().norm() < consistency_translation_thresh_ &&
+        std::abs(Eigen::AngleAxisd(new_delta.linear()).angle()) < consistency_yaw_thresh_) {
+      relocalization_mode_ = MODE_NORMAL;
+      RCLCPP_INFO(get_logger(), "correction applied, returning to NORMAL mode");
+    }
+
+    RCLCPP_INFO(
+      get_logger(),
+      "correction accepted: mode=%d score=%.3f delta=%.3fm local_map=%zu points",
+      static_cast<int>(relocalization_mode_), result.score,
+      delta_translation, result.local_map->size());
+
+    publishCorrectedOdom(odom, map_to_odom, relocalization_pose);
     publishAlignedScan(*result.aligned, msg->header.stamp);
     publishLocalMap(*result.local_map, msg->header.stamp);
   }
@@ -530,6 +706,24 @@ private:
   int relocalize_every_n_scans_ = 1;
   int scan_count_ = 0;
   int sor_mean_k_ = 50;
+
+  // --- Adaptive relocalization parameters ---
+  int lost_relocalize_every_n_ = 1;
+  int drift_relocalize_every_n_ = 3;
+  int drift_consistency_frames_ = 3;
+  int min_recovery_map_points_ = 200;
+  double consistency_translation_thresh_ = 0.5;
+  double consistency_yaw_thresh_ = 0.1;
+  double max_correction_translation_ = 2.0;
+  double max_correction_yaw_ = 0.5;
+  double drift_score_threshold_ = 0.3;
+  double drift_consistency_translation_ = 0.3;
+  double drift_consistency_yaw_ = 0.1;
+
+  // --- Adaptive relocalization state ---
+  enum RelocalizationMode { MODE_NORMAL, MODE_DRIFT, MODE_LOST };
+  RelocalizationMode relocalization_mode_ = MODE_NORMAL;
+  std::vector<Eigen::Isometry3d> pending_corrections_;
 
   std::vector<double> voxel_leaf_sizes_;
   std::vector<CloudT::Ptr> map_pyramid_;
